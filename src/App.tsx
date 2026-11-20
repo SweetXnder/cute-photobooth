@@ -7,6 +7,7 @@ import {
   Film,
   FlipHorizontal,
   RotateCcw,
+  SwitchCamera,
   Upload,
   Volume2,
   VolumeX,
@@ -54,7 +55,9 @@ export function App() {
   const activeFilter =
     FILTER_PRESETS.find((f) => f.id === filterId) || FILTER_PRESETS[0];
   const [isMirrored, setIsMirrored] = useState<boolean>(true);
+  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [cameraReady, setCameraReady] = useState<boolean>(false);
+  const [mobileTab, setMobileTab] = useState<'frames' | 'face' | 'booth' | 'filter' | 'more'>('frames');
 
   // Capture & Timer State
   const [countdownSec, setCountdownSec] = useState<number>(3);
@@ -128,7 +131,7 @@ export function App() {
   };
 
   // Start hidden webcam stream
-  const startCamera = useCallback(async () => {
+  const startCamera = useCallback(async (mode: 'user' | 'environment' = facingMode) => {
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((t) => t.stop());
     }
@@ -141,7 +144,7 @@ export function App() {
         video: {
           width: { ideal: 1280 },
           height: { ideal: 960 },
-          facingMode: 'user',
+          facingMode: { ideal: mode },
         },
         audio: false,
       });
@@ -154,16 +157,23 @@ export function App() {
     } catch {
       setCameraReady(false);
     }
-  }, []);
+  }, [facingMode]);
+
+  const handleFlipCamera = () => {
+    soundFX.playPop(620);
+    const nextMode = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(nextMode);
+    setIsMirrored(nextMode === 'user');
+  };
 
   useEffect(() => {
-    startCamera();
+    startCamera(facingMode);
     return () => {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [startCamera]);
+  }, [startCamera, facingMode]);
 
   const latestLiveFacesRef = useRef<NormalizedFaceBox[]>([]);
 
@@ -487,6 +497,11 @@ export function App() {
 
   const handleDownloadMp4 = async () => {
     if (isExportingMp4) return;
+    if (typeof VideoEncoder === 'undefined') {
+      // Fallback gracefully to GIF on mobile browsers without WebCodecs
+      await handleDownloadGif();
+      return;
+    }
     setIsExportingMp4(true);
     try {
       const exportPoses = getExportPoses();
@@ -539,9 +554,9 @@ export function App() {
         onChange={handleFileChange}
       />
 
-      {/* LEFT DOCK: Minimal Theme List (Bold Name Only) & Layout */}
+      {/* LEFT DOCK (Desktop): Minimal Theme List (Bold Name Only) & Layout */}
       {!cleanView && (
-        <aside className="side-dock">
+        <aside className="side-dock desktop-only">
           <div>
             <div className="dock-label">Layout</div>
             <div className="segmented-control">
@@ -596,14 +611,24 @@ export function App() {
 
         {!cleanView && selectedSlotIndex !== null && (
           <div className="slot-hint-pill">
-            Slot 0{selectedSlotIndex + 1} live — click Snap / Retake or click outside to lock
+            Slot 0{selectedSlotIndex + 1} live — tap Snap / Retake or tap outside to lock
           </div>
+        )}
+
+        {!cameraReady && (
+          <button
+            type="button"
+            className="mobile-camera-retry"
+            onClick={() => startCamera(facingMode)}
+          >
+            Tap to Enable Camera
+          </button>
         )}
       </main>
 
-      {/* RIGHT DOCK: Minimal Shoot, Mac Booth FX, Filters, Footer & Save */}
+      {/* RIGHT DOCK (Desktop): Minimal Shoot, Mac Booth FX, Filters, Footer & Save */}
       {!cleanView && (
-        <aside className="side-dock">
+        <aside className="side-dock desktop-only">
           <div>
             <div className="dock-label">Capture</div>
             <button
@@ -842,7 +867,317 @@ export function App() {
         </aside>
       )}
 
-      {/* Corner Toggle to Hide/Show Side Docks for IG/TikTok Aesthetic Screen Captures */}
+      {/* Mobile Floating Top Actions (Flip Front/Back Camera + Clean View) */}
+      <div className="mobile-top-actions mobile-only">
+        <button
+          type="button"
+          className="mobile-icon-pill"
+          onClick={handleFlipCamera}
+          title="Switch Front / Back Camera"
+          aria-label="Switch Camera"
+        >
+          <SwitchCamera size={17} />
+        </button>
+        <button
+          type="button"
+          className="mobile-icon-pill"
+          onClick={() => setCleanView(!cleanView)}
+          title={cleanView ? 'Show Controls' : 'Clean View'}
+          aria-label={cleanView ? 'Show Controls' : 'Clean View'}
+        >
+          {cleanView ? <Eye size={17} /> : <EyeOff size={17} />}
+        </button>
+      </div>
+
+      {/* Mobile Bottom Control Sheet */}
+      {!cleanView && (
+        <section className="mobile-sheet mobile-only">
+          {/* Quick Capture Row */}
+          <div className="mobile-quick-bar">
+            <button
+              type="button"
+              className="mobile-quick-btn"
+              disabled={isCapturingSequence}
+              onClick={handleInstantSnap}
+            >
+              Snap
+            </button>
+
+            <button
+              type="button"
+              className="btn-shoot"
+              disabled={isCapturingSequence}
+              onClick={() => handleStartSession(selectedSlotIndex)}
+            >
+              <Camera size={16} />
+              <span>
+                {isCapturingSequence
+                  ? 'Shooting...'
+                  : selectedSlotIndex !== null
+                  ? `Retake 0${selectedSlotIndex + 1} (${countdownSec}s)`
+                  : `Shoot 4-Shot (${countdownSec}s)`}
+              </span>
+            </button>
+
+            <button
+              type="button"
+              className="mobile-quick-btn"
+              onClick={handleDownloadPng}
+              title="Save PNG"
+              aria-label="Save PNG"
+            >
+              <Download size={16} />
+            </button>
+
+            <button
+              type="button"
+              className="mobile-quick-btn"
+              onClick={() => {
+                setPoses([0, 1, 2, 3].map(() => ({ dataUrl: null, burstUrls: [] })));
+                setSelectedSlotIndex(null);
+              }}
+              title="Reset Live"
+              aria-label="Reset Live"
+            >
+              <RotateCcw size={15} />
+            </button>
+          </div>
+
+          {/* Mobile 5-Tab Bar */}
+          <div className="mobile-tabs">
+            {(
+              [
+                ['frames', 'Frames'],
+                ['face', 'Face FX'],
+                ['booth', 'Booth FX'],
+                ['filter', 'Filters'],
+                ['more', 'More'],
+              ] as const
+            ).map(([tabKey, label]) => (
+              <button
+                key={tabKey}
+                type="button"
+                className={`mobile-tab-btn ${mobileTab === tabKey ? 'active' : ''}`}
+                onClick={() => {
+                  soundFX.playPop(600);
+                  setMobileTab(tabKey);
+                }}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {/* Mobile Tab Content Tray */}
+          <div className="mobile-tray">
+            {mobileTab === 'frames' && (
+              <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
+                <div className="segmented-control">
+                  <button
+                    type="button"
+                    className={`seg-btn ${layout === '1x4' ? 'active' : ''}`}
+                    onClick={() => setLayout('1x4')}
+                  >
+                    1×4 Strip
+                  </button>
+                  <button
+                    type="button"
+                    className={`seg-btn ${layout === '2x2' ? 'active' : ''}`}
+                    onClick={() => setLayout('2x2')}
+                  >
+                    2×2 Grid
+                  </button>
+                </div>
+                <div className="mobile-hscroll">
+                  {THEME_LIST.map((t) => (
+                    <button
+                      key={t.id}
+                      type="button"
+                      className={`mobile-theme-card ${themeId === t.id ? 'active' : ''}`}
+                      onClick={() => handleSelectTheme(t.id)}
+                    >
+                      <div className="theme-thumb" style={{ background: t.bgPrimary }}>
+                        <img src={t.previewThumb} alt={t.title} />
+                      </div>
+                      <span className="theme-bold-name">{t.title}</span>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {mobileTab === 'face' && (
+              <div className="mobile-hscroll">
+                <button
+                  type="button"
+                  className={`face-fx-btn mobile-face-card ${faceEffect === 'none' ? 'active' : ''}`}
+                  onClick={() => {
+                    soundFX.playPop(580);
+                    setFaceEffect('none');
+                  }}
+                >
+                  <span style={{ fontSize: '0.78rem', lineHeight: '34px' }}>None</span>
+                </button>
+                {FACE_EFFECT_PRESETS.map((fx) => (
+                  <button
+                    key={fx.id}
+                    type="button"
+                    className={`face-fx-btn mobile-face-card ${faceEffect === fx.id ? 'active' : ''}`}
+                    onClick={() => {
+                      soundFX.playPop(680);
+                      setFaceEffect(fx.id);
+                    }}
+                  >
+                    <img src={fx.src} alt={fx.name} />
+                    <span>{fx.name}</span>
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {mobileTab === 'booth' && (
+              <div className="mobile-pill-grid-4">
+                {BOOTH_EFFECT_PRESETS.map((fx) => (
+                  <button
+                    key={fx.id}
+                    type="button"
+                    className={`filter-pill ${boothEffect === fx.id ? 'active' : ''}`}
+                    onClick={() => {
+                      soundFX.playPop(620);
+                      setBoothEffect(fx.id);
+                    }}
+                  >
+                    {fx.name}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {mobileTab === 'filter' && (
+              <div className="mobile-pill-grid-3">
+                {FILTER_PRESETS.map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className={`filter-pill ${filterId === f.id ? 'active' : ''}`}
+                    onClick={() => setFilterId(f.id)}
+                  >
+                    {f.name}
+                  </button>
+                ))}
+              </div>
+            )}
+
+            {mobileTab === 'more' && (
+              <div className="mobile-more-stack">
+                <div className="mobile-more-row">
+                  <div className="segmented-control" style={{ flex: 1, gridTemplateColumns: '1fr 1fr 1fr' }}>
+                    {[3, 5, 10].map((sec) => (
+                      <button
+                        key={sec}
+                        type="button"
+                        className={`seg-btn ${countdownSec === sec ? 'active' : ''}`}
+                        onClick={() => setCountdownSec(sec)}
+                      >
+                        {sec}s
+                      </button>
+                    ))}
+                  </div>
+                  <button
+                    type="button"
+                    className="btn-minimal"
+                    onClick={() => setIsMirrored(!isMirrored)}
+                  >
+                    <FlipHorizontal size={13} />
+                    <span>{isMirrored ? 'Mirror' : 'Normal'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-minimal"
+                    style={{ padding: '8px 10px' }}
+                    onClick={toggleSound}
+                  >
+                    {soundEnabled ? <Volume2 size={14} /> : <VolumeX size={14} />}
+                  </button>
+                </div>
+
+                <div className="mobile-more-row">
+                  <input
+                    type="text"
+                    className="minimal-input"
+                    value={customHeader}
+                    onChange={(e) => setCustomHeader(e.target.value)}
+                    placeholder="Top header..."
+                    maxLength={36}
+                  />
+                  <input
+                    type="text"
+                    className="minimal-input"
+                    value={customCaption}
+                    onChange={(e) => setCustomCaption(e.target.value)}
+                    placeholder="Bottom caption..."
+                    maxLength={40}
+                  />
+                </div>
+
+                <div className="mobile-more-row">
+                  <input
+                    type="checkbox"
+                    checked={showDatestamp}
+                    onChange={(e) => setShowDatestamp(e.target.checked)}
+                    style={{ accentColor: 'var(--accent-primary)' }}
+                  />
+                  <input
+                    type="text"
+                    className="minimal-input"
+                    value={customDateText}
+                    onChange={(e) => setCustomDateText(e.target.value)}
+                    disabled={!showDatestamp}
+                    placeholder="Date..."
+                    maxLength={28}
+                  />
+                  <button
+                    type="button"
+                    className="btn-minimal"
+                    disabled={isCapturingSequence}
+                    onClick={() =>
+                      triggerSlotUpload(selectedSlotIndex !== null ? selectedSlotIndex : 0)
+                    }
+                  >
+                    <Upload size={13} />
+                    <span>Upload</span>
+                  </button>
+                </div>
+
+                <div className="mobile-more-row">
+                  <button
+                    type="button"
+                    className="btn-minimal"
+                    style={{ flex: 1 }}
+                    disabled={isExportingMp4}
+                    onClick={handleDownloadMp4}
+                  >
+                    <Film size={14} />
+                    <span>{isExportingMp4 ? 'Saving...' : 'Save MP4'}</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-minimal"
+                    style={{ flex: 1 }}
+                    disabled={isExportingGif}
+                    onClick={handleDownloadGif}
+                  >
+                    <Film size={14} />
+                    <span>{isExportingGif ? 'Saving...' : 'Save GIF'}</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </section>
+      )}
+
+      {/* Corner Toggle (Desktop) to Hide/Show Side Docks for IG/TikTok Aesthetic Screen Captures */}
       <button
         type="button"
         className="clean-view-toggle"
