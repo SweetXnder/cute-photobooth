@@ -57,6 +57,9 @@ export function App() {
   const [isMirrored, setIsMirrored] = useState<boolean>(true);
   const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
   const [cameraReady, setCameraReady] = useState<boolean>(false);
+  const [cameraError, setCameraError] = useState<string | null>(null);
+  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
+  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [mobileTab, setMobileTab] = useState<'frames' | 'face' | 'booth' | 'filter' | 'more'>('frames');
 
   // Capture & Timer State
@@ -130,50 +133,109 @@ export function App() {
     soundFX.enabled = next;
   };
 
-  // Start hidden webcam stream
-  const startCamera = useCallback(async (mode: 'user' | 'environment' = facingMode) => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-    }
-    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      setCameraReady(false);
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          width: { ideal: 1280 },
-          height: { ideal: 960 },
-          facingMode: { ideal: mode },
-        },
-        audio: false,
-      });
+  // Start hidden webcam stream with Edge-safe constraint fallbacks
+  const startCamera = useCallback(
+    async (mode: 'user' | 'environment' = facingMode, deviceId: string = selectedDeviceId) => {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+        streamRef.current = null;
+      }
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setCameraReady(false);
+        setCameraError('Camera unavailable — open this page over HTTPS in Edge, Chrome, or Safari.');
+        return;
+      }
+
+      const attempts: MediaStreamConstraints[] = deviceId
+        ? [
+            { video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 960 } }, audio: false },
+            { video: { deviceId: { exact: deviceId } }, audio: false },
+            { video: true, audio: false },
+          ]
+        : [
+            { video: { width: { ideal: 1280 }, height: { ideal: 960 }, facingMode: { ideal: mode } }, audio: false },
+            { video: { facingMode: mode }, audio: false },
+            { video: true, audio: false },
+          ];
+
+      let stream: MediaStream | null = null;
+      let lastErr: unknown = null;
+
+      for (const constraints of attempts) {
+        try {
+          stream = await navigator.mediaDevices.getUserMedia(constraints);
+          break;
+        } catch (err) {
+          lastErr = err;
+          const errName = (err as DOMException)?.name;
+          if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
+            break;
+          }
+        }
+      }
+
+      if (!stream) {
+        setCameraReady(false);
+        const errName = (lastErr as DOMException)?.name || '';
+        if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
+          setCameraError('Camera blocked — click the lock/camera icon in the address bar and allow Camera, then tap Retry.');
+        } else if (errName === 'NotReadableError' || errName === 'TrackStartError') {
+          setCameraError('Camera is busy in another app — close it or switch cameras, then tap Retry.');
+        } else if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
+          setCameraError('No camera detected on this device.');
+        } else {
+          setCameraError('Could not start camera — tap to retry or upload photos.');
+        }
+        return;
+      }
+
       streamRef.current = stream;
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        await videoRef.current.play().catch(() => {});
+      setCameraError(null);
+
+      // Refresh device list after permission is granted (Edge populates labels only after grant)
+      try {
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        setVideoDevices(devices.filter((d) => d.kind === 'videoinput'));
+      } catch {
+        // Ignore enumerateDevices failure
+      }
+
+      const video = videoRef.current;
+      if (video) {
+        video.srcObject = stream;
+        if (video.readyState < 1) {
+          await new Promise<void>((resolve) => {
+            const onMeta = () => {
+              video.removeEventListener('loadedmetadata', onMeta);
+              resolve();
+            };
+            video.addEventListener('loadedmetadata', onMeta, { once: true });
+            setTimeout(resolve, 1500);
+          });
+        }
+        await video.play().catch(() => {});
       }
       setCameraReady(true);
-    } catch {
-      setCameraReady(false);
-    }
-  }, [facingMode]);
+    },
+    [facingMode, selectedDeviceId]
+  );
 
   const handleFlipCamera = () => {
     soundFX.playPop(620);
     const nextMode = facingMode === 'user' ? 'environment' : 'user';
+    setSelectedDeviceId('');
     setFacingMode(nextMode);
     setIsMirrored(nextMode === 'user');
   };
 
   useEffect(() => {
-    startCamera(facingMode);
+    startCamera(facingMode, selectedDeviceId);
     return () => {
       if (streamRef.current) {
         streamRef.current.getTracks().forEach((t) => t.stop());
       }
     };
-  }, [startCamera, facingMode]);
+  }, [startCamera, facingMode, selectedDeviceId]);
 
   const latestLiveFacesRef = useRef<NormalizedFaceBox[]>([]);
 
@@ -536,13 +598,22 @@ export function App() {
       className={`studio-stage ${cleanView ? 'clean-view' : ''}`}
       style={{ backgroundColor: activeTheme.bgPrimary + '55' }}
     >
-      {/* Hidden video element that streams into the frame canvas */}
+      {/* Hidden video element (non-zero size & opacity so Edge/Chromium never throttles playback) */}
       <video
         ref={videoRef}
         playsInline
         muted
         autoPlay
-        style={{ position: 'fixed', width: 1, height: 1, opacity: 0, pointerEvents: 'none' }}
+        style={{
+          position: 'fixed',
+          top: 0,
+          left: 0,
+          width: 320,
+          height: 240,
+          opacity: 0.001,
+          pointerEvents: 'none',
+          zIndex: -1,
+        }}
       />
 
       <input
@@ -619,9 +690,9 @@ export function App() {
           <button
             type="button"
             className="mobile-camera-retry"
-            onClick={() => startCamera(facingMode)}
+            onClick={() => startCamera(facingMode, selectedDeviceId)}
           >
-            Tap to Enable Camera
+            {cameraError || 'Tap to Enable Camera'}
           </button>
         )}
       </main>
@@ -631,6 +702,21 @@ export function App() {
         <aside className="side-dock desktop-only">
           <div>
             <div className="dock-label">Capture</div>
+            {videoDevices.length > 1 && (
+              <select
+                className="minimal-input"
+                style={{ marginBottom: '6px', cursor: 'pointer' }}
+                value={selectedDeviceId}
+                onChange={(e) => setSelectedDeviceId(e.target.value)}
+                aria-label="Select Camera"
+              >
+                {videoDevices.map((dev, idx) => (
+                  <option key={dev.deviceId} value={dev.deviceId}>
+                    {dev.label || `Camera ${idx + 1}`}
+                  </option>
+                ))}
+              </select>
+            )}
             <button
               type="button"
               className="btn-shoot"
