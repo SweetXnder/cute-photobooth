@@ -1,6 +1,8 @@
 import { FaceDetector, FilesetResolver, Detection } from '@mediapipe/tasks-vision';
 import { NormalizedFaceBox } from '../types/photobooth';
 
+const MAX_CONSECUTIVE_MISSES = 8;
+
 let videoDetector: FaceDetector | null = null;
 let imageDetector: FaceDetector | null = null;
 let initPromise: Promise<void> | null = null;
@@ -8,6 +10,14 @@ let initPromise: Promise<void> | null = null;
 let lastVideoDetectMs = 0;
 let lastVideoTime = -1;
 let smoothedFaces: NormalizedFaceBox[] = [];
+let consecutiveMisses = 0;
+
+export function resetFaceTrackerState(): void {
+  smoothedFaces = [];
+  consecutiveMisses = 0;
+  lastVideoDetectMs = 0;
+  lastVideoTime = -1;
+}
 
 export async function ensureFaceTrackerReady(): Promise<void> {
   if (videoDetector && imageDetector) return;
@@ -86,7 +96,6 @@ function mapDetectionsToSlotCoords(
       cx = 1 - cx;
     }
 
-    // Ignore faces completely outside the 4:3 crop
     if (cx < -0.15 || cx > 1.15 || cy < -0.15 || cy > 1.15) continue;
 
     let angle = 0;
@@ -109,7 +118,6 @@ function mapDetectionsToSlotCoords(
       }
       if (Math.hypot(dx, dy) > 0.01) {
         angle = Math.atan2(dy, dx);
-        // Clamp extreme angles
         angle = Math.max(-0.55, Math.min(0.55, angle));
       }
     }
@@ -117,7 +125,6 @@ function mapDetectionsToSlotCoords(
     mapped.push({ cx, cy, w, h, angle });
   }
 
-  // Sort left-to-right for stable matching
   mapped.sort((a, b) => a.cx - b.cx);
   return mapped;
 }
@@ -129,7 +136,7 @@ function smoothFaceList(
   if (next.length === 0) return [];
   if (prev.length !== next.length) return next;
 
-  const alpha = 0.42; // Responsive yet jitter-free
+  const alpha = 0.42;
   return next.map((n, i) => {
     const p = prev[i];
     if (Math.abs(p.cx - n.cx) > 0.25) return n;
@@ -146,6 +153,8 @@ function smoothFaceList(
 /**
  * Runs throttled (~30fps) face detection on the live webcam video and returns
  * smoothed face bounding boxes in normalized 4:3 slot coordinates.
+ * Holds the last valid detection for up to MAX_CONSECUTIVE_MISSES frames so
+ * blinks or screen flashes never drop tracked faces at shutter capture time.
  */
 export function detectFacesInVideoFrame(
   video: HTMLVideoElement,
@@ -171,7 +180,16 @@ export function detectFacesInVideoFrame(
       video.videoHeight,
       isMirrored
     );
-    smoothedFaces = smoothFaceList(smoothedFaces, rawFaces);
+
+    if (rawFaces.length > 0) {
+      consecutiveMisses = 0;
+      smoothedFaces = smoothFaceList(smoothedFaces, rawFaces);
+    } else {
+      consecutiveMisses += 1;
+      if (consecutiveMisses > MAX_CONSECUTIVE_MISSES) {
+        smoothedFaces = [];
+      }
+    }
   } catch {
     // Keep last smoothed faces on transient frame error
   }
@@ -180,7 +198,7 @@ export function detectFacesInVideoFrame(
 }
 
 /**
- * Runs one-shot face detection on a static/uploaded image.
+ * Runs one-shot face detection on a static/captured/uploaded image.
  */
 export async function detectFacesInImage(
   img: HTMLImageElement

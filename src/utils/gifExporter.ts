@@ -1,9 +1,7 @@
 import { GIFEncoder, quantize, applyPalette } from 'gifenc';
 import { Muxer, ArrayBufferTarget } from 'mp4-muxer';
 import {
-  BoothEffectId,
   CapturedPose,
-  FaceEffectId,
   FilterPreset,
   LayoutMode,
   ThemeConfig,
@@ -15,8 +13,6 @@ export interface AnimatedExportOptions {
   layout: LayoutMode;
   poses: CapturedPose[];
   filter: FilterPreset;
-  boothEffect?: BoothEffectId;
-  faceEffect?: FaceEffectId;
   customHeader?: string;
   customCaption: string;
   showDatestamp: boolean;
@@ -24,7 +20,8 @@ export interface AnimatedExportOptions {
 }
 
 /**
- * Renders the 4 burst composite canvases at the given target resolution
+ * Renders the 4 burst composite canvases at the given target resolution,
+ * preserving each slot's locked faceEffect, boothEffect, and per-burst-frame faceBoxes.
  */
 async function renderBurstCanvases(
   options: AnimatedExportOptions,
@@ -36,8 +33,6 @@ async function renderBurstCanvases(
     layout,
     poses,
     filter,
-    boothEffect = 'none',
-    faceEffect = 'none',
     customHeader,
     customCaption,
     showDatestamp,
@@ -49,9 +44,13 @@ async function renderBurstCanvases(
 
   for (let f = 0; f < 4; f++) {
     const framePoses: CapturedPose[] = poses.map((p) => {
-      if (p.burstUrls && p.burstUrls.length > 1) {
-        const bUrl = p.burstUrls[f % p.burstUrls.length];
-        return { dataUrl: bUrl, burstUrls: p.burstUrls };
+      if (p.burstFrames && p.burstFrames.length > 1) {
+        const bf = p.burstFrames[f % p.burstFrames.length];
+        return {
+          ...p,
+          dataUrl: bf.dataUrl,
+          faceBoxes: bf.faceBoxes.length > 0 ? bf.faceBoxes : p.faceBoxes,
+        };
       }
       return p;
     });
@@ -62,8 +61,6 @@ async function renderBurstCanvases(
       layout,
       poses: framePoses,
       filter,
-      boothEffect,
-      faceEffect,
       customHeader,
       customCaption,
       showDatestamp,
@@ -83,22 +80,55 @@ async function renderBurstCanvases(
   return canvases;
 }
 
+async function resolveSupportedH264Config(
+  width: number,
+  height: number,
+  fps: number
+): Promise<VideoEncoderConfig> {
+  const candidates = ['avc1.640033', 'avc1.64002a', 'avc1.4d002a', 'avc1.42001f'];
+  for (const codec of candidates) {
+    const config: VideoEncoderConfig = {
+      codec,
+      width,
+      height,
+      bitrate: 14_000_000,
+      framerate: fps,
+    };
+    try {
+      const support = await VideoEncoder.isConfigSupported(config);
+      if (support.supported) {
+        return config;
+      }
+    } catch {
+      // Try next profile/level
+    }
+  }
+  return {
+    codec: 'avc1.42001f',
+    width,
+    height,
+    bitrate: 10_000_000,
+    framerate: fps,
+  };
+}
+
 /**
- * Exports a high-bitrate, full-color 11.2-second (10 loops) H.264 .mp4 video
+ * Exports a high-bitrate, full-color 11.7-second (11 loops) H.264 .mp4 video
  */
 export async function exportAnimatedPurikuraMp4(
   options: AnimatedExportOptions
 ): Promise<Blob> {
-  // Dimensions divisible by 16 for hardware H.264 VideoEncoder compatibility
   const mp4W = options.layout === '1x4' ? 960 : 1280;
   const mp4H = options.layout === '1x4' ? 2880 : 1312;
 
   const burstCanvases = await renderBurstCanvases(options, mp4W, mp4H);
 
   const fps = 30;
-  const framesPerStep = 8; // 8 / 30s = 0.266s per burst pose
-  const totalLoops = 11; // 11 * 4 * 8 / 30 = 11.73 seconds (> 10s)
+  const framesPerStep = 8;
+  const totalLoops = 11;
   const totalVideoFrames = totalLoops * 4 * framesPerStep;
+
+  const encoderConfig = await resolveSupportedH264Config(mp4W, mp4H, fps);
 
   const target = new ArrayBufferTarget();
   const muxer = new Muxer({
@@ -116,13 +146,7 @@ export async function exportAnimatedPurikuraMp4(
     error: (err) => console.error('VideoEncoder error:', err),
   });
 
-  encoder.configure({
-    codec: 'avc1.640033', // High Profile Level 5.1 (supports up to 4K)
-    width: mp4W,
-    height: mp4H,
-    bitrate: 16_000_000,
-    framerate: fps,
-  });
+  encoder.configure(encoderConfig);
 
   const frameDurationUs = Math.round(1_000_000 / fps);
 
@@ -140,6 +164,7 @@ export async function exportAnimatedPurikuraMp4(
   }
 
   await encoder.flush();
+  encoder.close();
   muxer.finalize();
 
   return new Blob([target.buffer], { type: 'video/mp4' });

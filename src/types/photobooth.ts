@@ -117,8 +117,26 @@ export interface ThemeConfig {
   placements: FrameCharacterPlacement[];
 }
 
+export interface BurstFrame {
+  dataUrl: string;
+  faceBoxes: NormalizedFaceBox[];
+}
+
 export interface CapturedPose {
   dataUrl: string | null;
-  burstUrls: string[];
-  faceBoxes?: NormalizedFaceBox[];
+  burstFrames: BurstFrame[];
+  faceBoxes: NormalizedFaceBox[];
+  /** Per-slot locked effects captured at shutter time */
+  faceEffect: FaceEffectId;
+  boothEffect: BoothEffectId;
+}
+
+export function createEmptyPose(): CapturedPose {
+  return {
+    dataUrl: null,
+    burstFrames: [],
+    faceBoxes: [],
+    faceEffect: 'none',
+    boothEffect: 'none',
+  };
 }

@@ -1,50 +1,42 @@
-# Architecture Design — Cute Photobooth
+# Architecture Design — Cute Photobooth (v2 Clean Architecture)
 
-## 1. High-Level Data Flow
+## 1. Layered System Diagram
 
 ```text
-+-------------------+      60fps rAF       +-----------------------+
-|  Hidden <video>   | -------------------> |  renderLiveFrameSync  |
-|  (WebRTC Stream)  |                      |  (canvasRenderer.ts)  |
-+-------------------+                      +-----------------------+
-         |                                    ^        ^        ^
-         | ~30fps throttled                   |        |        |
-         v                                    |        |        |
-+-------------------+    NormalizedFaceBox[]  |        |        |
-|   faceTracker.ts  | ------------------------+        |        |
-| (MediaPipe WASM)  |                                  |        |
-+-------------------+                                  |        |
-                                                       |        |
-+-------------------+    Warped 240x240 Face Patch     |        |
-|  cuteFaceWarp.ts  | ---------------------------------+        |
-+-------------------+                                           |
-                                                                |
-+-------------------+    560x420 Shader Output                  |
-| macBoothEffects.ts| ------------------------------------------+
-+-------------------+
++-------------------------------------------------------------------+
+|                     Presentation Layer (App.tsx)                  |
+|  Desktop Side Docks  |  Hero <canvas>  |  Mobile Bottom Sheet     |
+|  Ref-backed stable 60fps rAF loop (renderScale = 0.5 live)        |
++-------------------------------------------------------------------+
+           |                                      |
+           v                                      v
++--------------------------+          +-----------------------------+
+|  useCameraStream Hook    |          |  usePhotoboothSession Hook  |
+|  - Cascading constraints |          |  - Cancellable 4-shot FSM   |
+|  - Request-ID race guard |          |  - Per-slot immutable pose  |
+|  - Device switcher       |          |    (faceEffect, boothEffect,|
+|  - FaceTracker reset     |          |     burstFrames+faceBoxes)  |
++--------------------------+          +-----------------------------+
+           |                                      |
+           +------------------+-------------------+
+                              v
++-------------------------------------------------------------------+
+|                 Rendering & Media Pipeline (utils/)               |
+|  - canvasRenderer.ts : Dual-scale compositor (0.5x live / 1x PNG) |
+|  - imageCache.ts     : Static pinned + bounded 48-entry LRU cache |
+|  - faceTracker.ts    : MediaPipe BlazeFace + 8-frame miss hold    |
+|  - cuteFaceWarp.ts   : 240x240 LUT chubby-cheek warp + blush      |
+|  - macBoothEffects.ts: 560x420 spatial & color LUT shaders        |
+|  - gifExporter.ts    : Per-burst faceBox MP4 (probed H.264) & GIF |
++-------------------------------------------------------------------+
 ```
 
 ---
 
-## 2. Core Subsystems
+## 2. Key Architectural Guarantees
 
-### A. Single-Canvas Live Studio (`src/utils/canvasRenderer.ts`)
-Instead of rendering a separate camera preview and a separate strip preview, the application runs a single `requestAnimationFrame` loop that composites directly into the center `<canvas>`:
-1. **Background & Header Layer:** Renders theme gradients, subtle grid/check/split patterns, and customizable header text.
-2. **Slot Layer (`1×4` or `2×2`):** Each of the 4 slots independently displays either the live camera feed (for empty or selected retake slots) or the captured pose image.
-3. **Character Overlay Layer:** Composites preloaded transparent character PNGs at layout-specific normalized coordinates (`1x4` vs `2x2`).
-4. **Footer Layer:** Renders the customizable tagline and datestamp.
-
-### B. Multi-Face Tracking & Face-in-Hole Fitting (`src/utils/faceTracker.ts` & `src/utils/cuteFaceWarp.ts`)
-- **Local MediaPipe BlazeFace:** Loads WASM and `blaze_face_short_range.tflite` from `public/mediapipe/` so tracking runs locally in the browser with zero external network dependency.
-- **Coordinate Mapping:** Converts raw `<video>` pixel bounding boxes and eye keypoints into the `4:3` cover-cropped, optionally mirrored slot coordinate space (`NormalizedFaceBox`), computing head roll angle from eye positions and smoothing across frames with an exponential moving average.
-- **Chubby-Cheek LUT Warp:** Precomputes a `240×240` `Uint32Array` displacement lookup table for subtle cheek puffiness and bright-eye scaling. Each detected face is sampled, warped, blushed with radial gradients, clipped to the plushie's oval opening, and layered beneath the transparent fruit cutout.
-
-### C. Mac Photo Booth Pixel Shaders (`src/utils/macBoothEffects.ts`)
-- **Spatial Warps (`Bulge`, `Pinch`, `Twirl`, `Mirror`):** Precomputed `560×420` `Uint32Array` coordinate LUTs allow O(1) per-pixel remapping at 60fps.
-- **Color Shaders (`Thermal`, `X-Ray`, `Pop Art`):** Uses precomputed 256-entry packed `ABGR` `Uint32Array` luminance lookup tables for fast single-pass pixel shading.
-
-### D. High-DPI Export Pipeline (`src/utils/gifExporter.ts`, `src/App.tsx`)
-- **PNG:** Offscreen `renderPhotoboothComposite()` renders at `1200×3600` (`1×4`) or `1600×1640` (`2×2`) after awaiting all asset preloads.
-- **MP4:** Captures intermediate burst frames during countdowns, composites 4 high-res canvases, and encodes an 11.7-second `30fps` H.264 stream using the browser's hardware `VideoEncoder` (`WebCodecs`) muxed via `mp4-muxer`.
-- **GIF:** Quantizes the 4 burst composite frames to 256-color palettes with `gifenc` for instant client-side GIF downloads.
+1. **Immutable Per-Slot Snapshots:** Every `CapturedPose` locks its own `faceEffect`, `boothEffect`, `faceBoxes`, and `burstFrames` (`{ dataUrl, faceBoxes }[]`) at capture time. Changing effects for Slot 2 never retroactively mutates Slot 1.
+2. **Zero-Drop Export Hydration:** `faceTracker.ts` holds tracked faces across brief blinks/flashes (`MAX_CONSECUTIVE_MISSES = 8`), and `renderPhotoboothComposite` runs a safety-net static `detectFacesInImage` pass if any captured slot with a `faceEffect` has empty `faceBoxes`, eliminating stationary center-fallback bugs in exported PNGs, MP4s, and GIFs.
+3. **Bounded Memory:** `imageCache.ts` separates permanent static theme/effect assets from a bounded 48-entry LRU cache for transient `data:` URLs, and `processedPoseCache` is LRU-capped at 24 entries.
+4. **Race-Free Async Lifecycles:** `useCameraStream` guards hardware `getUserMedia` calls with a monotonic `requestIdRef` (stopping stale streams immediately), and `usePhotoboothSession` guards countdown sequences with a cancellable `sessionTokenRef`.
+5. **4× Lighter Live Preview:** Live `rAF` renders at `renderScale = 0.5` (`600×1800` / `800×820`) via a single stable ref-backed loop that never tears down on React state updates, while PNG export renders at full `1.0` (`1200×3600` / `1600×1640`).

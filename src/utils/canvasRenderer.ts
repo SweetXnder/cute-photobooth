@@ -9,34 +9,14 @@ import {
 } from '../types/photobooth';
 import { FACE_EFFECT_MAP } from '../data/faceEffects';
 import { drawCuteFaceInsideHole } from './cuteFaceWarp';
+import { detectFacesInImage } from './faceTracker';
+import { getCachedImage, loadImage } from './imageCache';
 import { renderWithMacBoothEffect } from './macBoothEffects';
 
-const imageCache = new Map<string, HTMLImageElement>();
+export { getCachedImage, loadImage };
+
+const MAX_PROCESSED_POSE_CACHE = 24;
 const processedPoseCache = new Map<string, HTMLCanvasElement>();
-
-export function loadImage(src: string): Promise<HTMLImageElement> {
-  if (imageCache.has(src)) {
-    return Promise.resolve(imageCache.get(src)!);
-  }
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = 'anonymous';
-    img.onload = () => {
-      imageCache.set(src, img);
-      resolve(img);
-    };
-    img.onerror = (err) => reject(err);
-    img.src = src;
-  });
-}
-
-export function getCachedImage(src: string): HTMLImageElement | null {
-  if (imageCache.has(src)) {
-    return imageCache.get(src)!;
-  }
-  loadImage(src).catch(() => {});
-  return null;
-}
 
 function getProcessedPoseCanvas(
   dataUrl: string,
@@ -44,14 +24,18 @@ function getProcessedPoseCanvas(
   boothEffect: BoothEffectId
 ): HTMLCanvasElement {
   const key = `${dataUrl.slice(-48)}_${img.width}x${img.height}_${boothEffect}`;
-  if (processedPoseCache.has(key)) {
-    return processedPoseCache.get(key)!;
+  const existing = processedPoseCache.get(key);
+  if (existing) {
+    processedPoseCache.delete(key);
+    processedPoseCache.set(key, existing);
+    return existing;
   }
   const c = document.createElement('canvas');
   renderWithMacBoothEffect(img, img.width, img.height, false, boothEffect, c);
-  if (processedPoseCache.size > 32) {
+  while (processedPoseCache.size >= MAX_PROCESSED_POSE_CACHE) {
     const firstKey = processedPoseCache.keys().next().value;
     if (firstKey) processedPoseCache.delete(firstKey);
+    else break;
   }
   processedPoseCache.set(key, c);
   return c;
@@ -69,17 +53,16 @@ export function getCanvasDimensions(layout: LayoutMode): { width: number; height
   if (layout === '1x4') {
     return { width: 1200, height: 3600 };
   }
-  // Balanced 2x2 Polaroid/Studio frame dimensions (no excess bottom gap)
   return { width: 1600, height: 1640 };
 }
 
 export function getPhotoSlotRects(layout: LayoutMode, width: number, height: number): SlotRect[] {
   if (layout === '1x4') {
-    const slotW = Math.round(width * 0.78); // 936px
-    const slotH = Math.round(slotW * (3 / 4)); // 702px
+    const slotW = Math.round(width * 0.78);
+    const slotH = Math.round(slotW * (3 / 4));
     const startX = Math.round((width - slotW) / 2);
-    const startY = Math.round(height * 0.075); // 270px
-    const gapY = Math.round(height * 0.014); // 50px
+    const startY = Math.round(height * 0.075);
+    const gapY = Math.round(height * 0.014);
     return [0, 1, 2, 3].map((i) => ({
       index: i,
       x: startX,
@@ -88,11 +71,11 @@ export function getPhotoSlotRects(layout: LayoutMode, width: number, height: num
       h: slotH,
     }));
   } else {
-    const gap = Math.round(width * 0.03); // 48px
-    const sideMargin = Math.round(width * 0.072); // 115px
-    const slotW = Math.round((width - sideMargin * 2 - gap) / 2); // 661px
-    const slotH = Math.round(slotW * (3 / 4)); // 496px
-    const startY = Math.round(height * 0.132); // 216px
+    const gap = Math.round(width * 0.03);
+    const sideMargin = Math.round(width * 0.072);
+    const slotW = Math.round((width - sideMargin * 2 - gap) / 2);
+    const slotH = Math.round(slotW * (3 / 4));
+    const startY = Math.round(height * 0.132);
     return [0, 1, 2, 3].map((i) => {
       const col = i % 2;
       const row = Math.floor(i / 2);
@@ -274,7 +257,7 @@ function drawSourceCover(
   }
 }
 
-const DEFAULT_FALLBACK_FACE: NormalizedFaceBox = {
+const LIVE_PREVIEW_FALLBACK_FACE: NormalizedFaceBox = {
   cx: 0.5,
   cy: 0.45,
   w: 0.26,
@@ -291,7 +274,8 @@ function drawFaceEffectOverlays(
   srcW: number,
   srcH: number,
   mirror: boolean,
-  filter: FilterPreset
+  filter: FilterPreset,
+  allowCenterFallback: boolean
 ) {
   if (faceEffect === 'none') return;
   const preset = FACE_EFFECT_MAP[faceEffect];
@@ -299,7 +283,12 @@ function drawFaceEffectOverlays(
   const img = getCachedImage(preset.src);
   if (!img) return;
 
-  const targets = faces && faces.length > 0 ? faces : [DEFAULT_FALLBACK_FACE];
+  const targets =
+    faces && faces.length > 0
+      ? faces
+      : allowCenterFallback
+      ? [LIVE_PREVIEW_FALLBACK_FACE]
+      : [];
 
   for (const face of targets) {
     const faceCenterX = slot.x + face.cx * slot.w;
@@ -308,7 +297,6 @@ function drawFaceEffectOverlays(
     const drawW = targetHoleW / preset.holeW;
     const drawH = drawW * (img.height / img.width);
 
-    // 1. Fit & warp the user's face into the oval hole with chubby cheeks + rosy blush
     drawCuteFaceInsideHole(
       ctx,
       source,
@@ -323,7 +311,6 @@ function drawFaceEffectOverlays(
       drawH
     );
 
-    // 2. Draw the transparent plushie costume neatly over the rim
     ctx.save();
     ctx.translate(faceCenterX, faceCenterY);
     ctx.rotate(face.angle);
@@ -344,8 +331,8 @@ function drawSlotSync(
   pose: CapturedPose | undefined,
   theme: ThemeConfig,
   filter: FilterPreset,
-  boothEffect: BoothEffectId,
-  faceEffect: FaceEffectId,
+  liveBoothEffect: BoothEffectId,
+  liveFaceEffect: FaceEffectId,
   liveFaceBoxes: NormalizedFaceBox[],
   isSelected: boolean,
   liveVideoSource?: HTMLVideoElement | HTMLCanvasElement | null,
@@ -396,27 +383,22 @@ function drawSlotSync(
       liveVideoSource instanceof HTMLVideoElement
         ? liveVideoSource.videoHeight
         : liveVideoSource.height;
+    const effectiveMirror = liveVideoMirroredAlready ? false : Boolean(isMirrored);
 
-    drawSourceCover(
-      ctx,
-      liveVideoSource,
-      srcW,
-      srcH,
-      slot,
-      filter,
-      liveVideoMirroredAlready ? false : Boolean(isMirrored)
-    );
+    drawSourceCover(ctx, liveVideoSource, srcW, srcH, slot, filter, effectiveMirror);
 
+    // Live slots use the active studio faceEffect & live tracked faces
     drawFaceEffectOverlays(
       ctx,
       slot,
       liveFaceBoxes,
-      faceEffect,
+      liveFaceEffect,
       liveVideoSource,
       srcW,
       srcH,
-      liveVideoMirroredAlready ? false : Boolean(isMirrored),
-      filter
+      effectiveMirror,
+      filter,
+      true
     );
 
     if (showFlash && isLiveTarget) {
@@ -439,19 +421,24 @@ function drawSlotSync(
   } else if (hasCaptured && pose?.dataUrl) {
     const img = getCachedImage(pose.dataUrl);
     if (img) {
-      if (boothEffect !== 'none') {
-        const fxCanvas = getProcessedPoseCanvas(pose.dataUrl, img, boothEffect);
+      // Captured slots are immutable snapshots: each slot uses its own locked boothEffect & faceEffect
+      const slotBoothFx = pose.boothEffect ?? 'none';
+      const slotFaceFx = pose.faceEffect ?? 'none';
+
+      if (slotBoothFx !== 'none') {
+        const fxCanvas = getProcessedPoseCanvas(pose.dataUrl, img, slotBoothFx);
         drawSourceCover(ctx, fxCanvas, fxCanvas.width, fxCanvas.height, slot, filter, false);
         drawFaceEffectOverlays(
           ctx,
           slot,
           pose.faceBoxes,
-          faceEffect,
+          slotFaceFx,
           fxCanvas,
           fxCanvas.width,
           fxCanvas.height,
           false,
-          filter
+          filter,
+          false
         );
       } else {
         drawSourceCover(ctx, img, img.width, img.height, slot, filter, false);
@@ -459,12 +446,13 @@ function drawSlotSync(
           ctx,
           slot,
           pose.faceBoxes,
-          faceEffect,
+          slotFaceFx,
           img,
           img.width,
           img.height,
           false,
-          filter
+          filter,
+          false
         );
       }
     } else {
@@ -474,6 +462,8 @@ function drawSlotSync(
     drawEmptyMinimalPlaceholder(ctx, slot, theme);
   }
 
+  // Silence unused param lint when liveBoothEffect is handled upstream
+  void liveBoothEffect;
   ctx.restore();
 }
 
@@ -494,10 +484,7 @@ function drawEmptyMinimalPlaceholder(
   ctx.globalAlpha = 1;
 }
 
-/**
- * Synchronous 60fps frame renderer for live camera-in-frame display
- */
-export function renderLiveFrameSync(options: {
+export interface RenderLiveFrameOptions {
   canvas: HTMLCanvasElement;
   theme: ThemeConfig;
   layout: LayoutMode;
@@ -516,7 +503,14 @@ export function renderLiveFrameSync(options: {
   isMirrored?: boolean;
   countdownDisplay?: string | null;
   showFlash?: boolean;
-}) {
+  /** 0.5 for 60fps live preview (4x fewer pixels), 1.0 for high-DPI PNG export */
+  renderScale?: number;
+}
+
+/**
+ * Synchronous 60fps frame renderer for live camera-in-frame display
+ */
+export function renderLiveFrameSync(options: RenderLiveFrameOptions) {
   const {
     canvas,
     theme,
@@ -536,24 +530,31 @@ export function renderLiveFrameSync(options: {
     isMirrored = true,
     countdownDisplay = null,
     showFlash = false,
+    renderScale = 1,
   } = options;
 
   const { width, height } = getCanvasDimensions(layout);
-  if (canvas.width !== width || canvas.height !== height) {
-    canvas.width = width;
-    canvas.height = height;
+  const targetW = Math.round(width * renderScale);
+  const targetH = Math.round(height * renderScale);
+
+  if (canvas.width !== targetW || canvas.height !== targetH) {
+    canvas.width = targetW;
+    canvas.height = targetH;
   }
 
   const ctx = canvas.getContext('2d');
   if (!ctx) return;
 
+  ctx.save();
+  ctx.setTransform(renderScale, 0, 0, renderScale, 0, 0);
   ctx.clearRect(0, 0, width, height);
+
   const slots = getPhotoSlotRects(layout, width, height);
 
   // 1. Background & Header
   renderMinimalBackground(ctx, theme, width, height, slots, customHeader);
 
-  // Prepare live video source (if MacBook Photo Booth effect is active, process once per tick)
+  // Prepare live video source once per tick
   const videoReady =
     liveVideo && liveVideo.readyState >= 2 && liveVideo.videoWidth > 0 && liveVideo.videoHeight > 0;
   let liveSource: HTMLVideoElement | HTMLCanvasElement | null = null;
@@ -575,7 +576,7 @@ export function renderLiveFrameSync(options: {
     }
   }
 
-  // 2. Photo Slots (with live camera inside empty/active slots!)
+  // 2. Photo Slots
   for (let i = 0; i < 4; i++) {
     const isLiveTarget =
       activeShootingSlot !== null
@@ -626,26 +627,22 @@ export function renderLiveFrameSync(options: {
   ctx.fillStyle = theme.textColor;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.fillText(
-    tagline,
-    width / 2,
-    showDatestamp ? footerCenterY - 22 : footerCenterY
-  );
+  ctx.fillText(tagline, width / 2, showDatestamp ? footerCenterY - 22 : footerCenterY);
 
   if (showDatestamp) {
     ctx.font = `500 ${layout === '1x4' ? 22 : 21}px "JetBrains Mono", monospace`;
     ctx.fillStyle = theme.subTextColor;
-    ctx.fillText(
-      customDateText.trim() || theme.defaultDatestamp,
-      width / 2,
-      footerCenterY + 24
-    );
+    ctx.fillText(customDateText.trim() || theme.defaultDatestamp, width / 2, footerCenterY + 24);
   }
+  ctx.restore();
+
   ctx.restore();
 }
 
 /**
- * Async wrapper that preloads all images before rendering for final PNG/GIF export
+ * Async full-resolution compositor for PNG/MP4/GIF export.
+ * Preloads all assets AND runs a safety-net static face detection pass on any
+ * captured slot that has a faceEffect enabled but empty faceBoxes.
  */
 export async function renderPhotoboothComposite(options: {
   canvas: HTMLCanvasElement;
@@ -653,22 +650,51 @@ export async function renderPhotoboothComposite(options: {
   layout: LayoutMode;
   poses: CapturedPose[];
   filter: FilterPreset;
-  boothEffect?: BoothEffectId;
-  faceEffect?: FaceEffectId;
   customHeader?: string;
   customCaption: string;
   showDatestamp: boolean;
   customDateText: string;
   selectedSlotIndex?: number | null;
 }) {
-  const { theme, poses, faceEffect = 'none' } = options;
-  const effectSrc = faceEffect !== 'none' ? FACE_EFFECT_MAP[faceEffect]?.src : null;
+  const { theme, poses } = options;
+
+  // Collect all unique per-slot face effect images to preload
+  const effectSrcs = new Set<string>();
+  for (const p of poses) {
+    if (p.faceEffect && p.faceEffect !== 'none') {
+      const src = FACE_EFFECT_MAP[p.faceEffect]?.src;
+      if (src) effectSrcs.add(src);
+    }
+  }
+
   await Promise.all([
     ...theme.placements.map((p) => loadImage(p.src).catch(() => {})),
-    ...(effectSrc ? [loadImage(effectSrc).catch(() => {})] : []),
+    ...Array.from(effectSrcs).map((src) => loadImage(src).catch(() => {})),
     ...poses
       .filter((p) => Boolean(p.dataUrl))
       .map((p) => loadImage(p.dataUrl!).catch(() => {})),
   ]);
-  renderLiveFrameSync(options);
+
+  // Safety net: if any captured pose has a faceEffect enabled but missed faceBoxes at capture time,
+  // run static IMAGE-mode MediaPipe detection so the downloaded PNG never falls back to a stationary center!
+  const hydratedPoses = await Promise.all(
+    poses.map(async (p) => {
+      if (p.dataUrl && p.faceEffect !== 'none' && (!p.faceBoxes || p.faceBoxes.length === 0)) {
+        const img = getCachedImage(p.dataUrl);
+        if (img) {
+          const detected = await detectFacesInImage(img);
+          if (detected.length > 0) {
+            return { ...p, faceBoxes: detected };
+          }
+        }
+      }
+      return p;
+    })
+  );
+
+  renderLiveFrameSync({
+    ...options,
+    poses: hydratedPoses,
+    renderScale: 1,
+  });
 }

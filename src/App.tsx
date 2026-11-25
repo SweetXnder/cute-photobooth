@@ -17,7 +17,6 @@ import { FILTER_PRESETS, THEME_LIST, THEMES } from './data/themes';
 import { FACE_EFFECT_PRESETS } from './data/faceEffects';
 import {
   BoothEffectId,
-  CapturedPose,
   FaceEffectId,
   FilterId,
   LayoutMode,
@@ -32,7 +31,6 @@ import {
   renderPhotoboothComposite,
 } from './utils/canvasRenderer';
 import {
-  detectFacesInImage,
   detectFacesInVideoFrame,
   ensureFaceTrackerReady,
 } from './utils/faceTracker';
@@ -42,40 +40,24 @@ import {
   exportAnimatedPurikuraMp4,
 } from './utils/gifExporter';
 import { soundFX } from './utils/sound';
+import { useCameraStream } from './hooks/useCameraStream';
+import { usePhotoboothSession } from './hooks/usePhotoboothSession';
 
 export function App() {
   const [themeId, setThemeId] = useState<ThemeId>('mofusand-berry');
   const activeTheme = THEMES[themeId];
   const [layout, setLayout] = useState<LayoutMode>('1x4');
 
-  // Camera, Face Effect, Mac Photo Booth Effect & Color Filter State
+  // Studio Active Effect & Filter State (applies to live slots; locked per-slot on capture)
   const [faceEffect, setFaceEffect] = useState<FaceEffectId>('none');
   const [boothEffect, setBoothEffect] = useState<BoothEffectId>('none');
   const [filterId, setFilterId] = useState<FilterId>('soft-peach');
   const activeFilter =
     FILTER_PRESETS.find((f) => f.id === filterId) || FILTER_PRESETS[0];
-  const [isMirrored, setIsMirrored] = useState<boolean>(true);
-  const [facingMode, setFacingMode] = useState<'user' | 'environment'>('user');
-  const [cameraReady, setCameraReady] = useState<boolean>(false);
-  const [cameraError, setCameraError] = useState<string | null>(null);
-  const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
-  const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
-  const [mobileTab, setMobileTab] = useState<'frames' | 'face' | 'booth' | 'filter' | 'more'>('frames');
 
-  // Capture & Timer State
-  const [countdownSec, setCountdownSec] = useState<number>(3);
-  const [countdownDisplay, setCountdownDisplay] = useState<string | null>(null);
-  const [isCapturingSequence, setIsCapturingSequence] = useState<boolean>(false);
-  const [activeShootingSlot, setActiveShootingSlot] = useState<number | null>(null);
-  const [showFlash, setShowFlash] = useState<boolean>(false);
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
   const [cleanView, setCleanView] = useState<boolean>(false);
-
-  // 4 Pose Slots (empty slots automatically stream live camera inside the frame!)
-  const [poses, setPoses] = useState<CapturedPose[]>(() =>
-    [0, 1, 2, 3].map(() => ({ dataUrl: null, burstUrls: [] }))
-  );
-  const [selectedSlotIndex, setSelectedSlotIndex] = useState<number | null>(null);
+  const [mobileTab, setMobileTab] = useState<'frames' | 'face' | 'booth' | 'filter' | 'more'>('frames');
 
   // Header, Footer Text & Datestamp
   const [customHeader, setCustomHeader] = useState<string>(
@@ -92,14 +74,58 @@ export function App() {
   const [isExportingGif, setIsExportingGif] = useState<boolean>(false);
   const [isExportingMp4, setIsExportingMp4] = useState<boolean>(false);
 
-  // Hidden video element feeding the center frame canvas
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const streamRef = useRef<MediaStream | null>(null);
   const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const uploadTargetSlotRef = useRef<number>(0);
+  const latestLiveFacesRef = useRef<NormalizedFaceBox[]>([]);
 
-  // Preload all theme character images & face effect PNGs so switching is instant
+  const triggerSlotUpload = useCallback((slotIdx: number) => {
+    uploadTargetSlotRef.current = slotIdx;
+    fileInputRef.current?.click();
+  }, []);
+
+  // Decoupled Camera Lifecycle Hook
+  const {
+    videoRef,
+    facingMode,
+    isMirrored,
+    setIsMirrored,
+    cameraReady,
+    cameraError,
+    videoDevices,
+    selectedDeviceId,
+    setSelectedDeviceId,
+    startCamera,
+    handleFlipCamera,
+  } = useCameraStream();
+
+  // Decoupled Capture / Session State Machine Hook
+  const {
+    poses,
+    selectedSlotIndex,
+    setSelectedSlotIndex,
+    countdownSec,
+    setCountdownSec,
+    countdownDisplay,
+    isCapturingSequence,
+    activeShootingSlot,
+    showFlash,
+    handleStartSession,
+    handleInstantSnap,
+    handleUploadedFiles,
+    resetAllPoses,
+    getExportPoses,
+  } = usePhotoboothSession({
+    videoRef,
+    cameraReady,
+    isMirrored,
+    faceEffect,
+    boothEffect,
+    latestLiveFacesRef,
+    onRequireUpload: triggerSlotUpload,
+  });
+
+  // Preload static theme character images & face effect cutouts once on mount
   useEffect(() => {
     THEME_LIST.forEach((t) => {
       t.placements.forEach((p) => {
@@ -111,173 +137,15 @@ export function App() {
     });
   }, []);
 
-  // Initialize MediaPipe FaceDetector when a face effect is turned on
+  // Initialize MediaPipe FaceDetector lazily when a face effect is enabled
   useEffect(() => {
     if (faceEffect !== 'none') {
       ensureFaceTrackerReady();
     }
   }, [faceEffect]);
 
-  const handleSelectTheme = (newId: ThemeId) => {
-    soundFX.playPop(680);
-    setThemeId(newId);
-    const nextTheme = THEMES[newId];
-    setCustomHeader(nextTheme.headerTitle);
-    setCustomCaption(nextTheme.defaultTagline);
-    setCustomDateText(nextTheme.defaultDatestamp);
-  };
-
-  const toggleSound = () => {
-    const next = !soundEnabled;
-    setSoundEnabled(next);
-    soundFX.enabled = next;
-  };
-
-  // Start hidden webcam stream with Edge-safe constraint fallbacks
-  const startCamera = useCallback(
-    async (mode: 'user' | 'environment' = facingMode, deviceId: string = selectedDeviceId) => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-        streamRef.current = null;
-      }
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setCameraReady(false);
-        setCameraError('Camera unavailable — open this page over HTTPS in Edge, Chrome, or Safari.');
-        return;
-      }
-
-      const attempts: MediaStreamConstraints[] = deviceId
-        ? [
-            { video: { deviceId: { exact: deviceId }, width: { ideal: 1280 }, height: { ideal: 960 } }, audio: false },
-            { video: { deviceId: { exact: deviceId } }, audio: false },
-            { video: true, audio: false },
-          ]
-        : [
-            { video: { width: { ideal: 1280 }, height: { ideal: 960 }, facingMode: { ideal: mode } }, audio: false },
-            { video: { facingMode: mode }, audio: false },
-            { video: true, audio: false },
-          ];
-
-      let stream: MediaStream | null = null;
-      let lastErr: unknown = null;
-
-      for (const constraints of attempts) {
-        try {
-          stream = await navigator.mediaDevices.getUserMedia(constraints);
-          break;
-        } catch (err) {
-          lastErr = err;
-          const errName = (err as DOMException)?.name;
-          if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
-            break;
-          }
-        }
-      }
-
-      if (!stream) {
-        setCameraReady(false);
-        const errName = (lastErr as DOMException)?.name || '';
-        if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError') {
-          setCameraError('Camera blocked — click the lock/camera icon in the address bar and allow Camera, then tap Retry.');
-        } else if (errName === 'NotReadableError' || errName === 'TrackStartError') {
-          setCameraError('Camera is busy in another app — close it or switch cameras, then tap Retry.');
-        } else if (errName === 'NotFoundError' || errName === 'DevicesNotFoundError') {
-          setCameraError('No camera detected on this device.');
-        } else {
-          setCameraError('Could not start camera — tap to retry or upload photos.');
-        }
-        return;
-      }
-
-      streamRef.current = stream;
-      setCameraError(null);
-
-      // Refresh device list after permission is granted (Edge populates labels only after grant)
-      try {
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        setVideoDevices(devices.filter((d) => d.kind === 'videoinput'));
-      } catch {
-        // Ignore enumerateDevices failure
-      }
-
-      const video = videoRef.current;
-      if (video) {
-        video.srcObject = stream;
-        if (video.readyState < 1) {
-          await new Promise<void>((resolve) => {
-            const onMeta = () => {
-              video.removeEventListener('loadedmetadata', onMeta);
-              resolve();
-            };
-            video.addEventListener('loadedmetadata', onMeta, { once: true });
-            setTimeout(resolve, 1500);
-          });
-        }
-        await video.play().catch(() => {});
-      }
-      setCameraReady(true);
-    },
-    [facingMode, selectedDeviceId]
-  );
-
-  const handleFlipCamera = () => {
-    soundFX.playPop(620);
-    const nextMode = facingMode === 'user' ? 'environment' : 'user';
-    setSelectedDeviceId('');
-    setFacingMode(nextMode);
-    setIsMirrored(nextMode === 'user');
-  };
-
-  useEffect(() => {
-    startCamera(facingMode, selectedDeviceId);
-    return () => {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-      }
-    };
-  }, [startCamera, facingMode, selectedDeviceId]);
-
-  const latestLiveFacesRef = useRef<NormalizedFaceBox[]>([]);
-
-  // 60fps requestAnimationFrame loop rendering live camera directly inside the center frame
-  useEffect(() => {
-    let animId = 0;
-    const renderTick = () => {
-      const canvas = frameCanvasRef.current;
-      const liveVideo = cameraReady ? videoRef.current : null;
-      const liveFaces =
-        faceEffect !== 'none' && liveVideo
-          ? detectFacesInVideoFrame(liveVideo, isMirrored)
-          : [];
-      latestLiveFacesRef.current = liveFaces;
-
-      if (canvas) {
-        renderLiveFrameSync({
-          canvas,
-          theme: activeTheme,
-          layout,
-          poses,
-          filter: activeFilter,
-          boothEffect,
-          faceEffect,
-          liveFaceBoxes: liveFaces,
-          customHeader,
-          customCaption,
-          showDatestamp,
-          customDateText,
-          selectedSlotIndex,
-          activeShootingSlot,
-          liveVideo,
-          isMirrored,
-          countdownDisplay,
-          showFlash,
-        });
-      }
-      animId = requestAnimationFrame(renderTick);
-    };
-    animId = requestAnimationFrame(renderTick);
-    return () => cancelAnimationFrame(animId);
-  }, [
+  // Ref-backed render state so the single 60fps rAF loop NEVER tears down/restarts on React re-renders
+  const renderStateRef = useRef({
     activeTheme,
     layout,
     poses,
@@ -294,174 +162,90 @@ export function App() {
     isMirrored,
     countdownDisplay,
     showFlash,
-  ]);
+  });
 
-  const grabVideoFrameDataUrl = useCallback((): string | null => {
-    const video = videoRef.current;
-    if (!cameraReady || !video || video.videoWidth === 0 || video.videoHeight === 0) {
-      return null;
-    }
-    const c = document.createElement('canvas');
-    c.width = 960;
-    c.height = 720;
-    const ctx = c.getContext('2d')!;
-
-    const vW = video.videoWidth;
-    const vH = video.videoHeight;
-    const targetAspect = 4 / 3;
-    const vAspect = vW / vH;
-    let sx = 0,
-      sy = 0,
-      sw = vW,
-      sh = vH;
-    if (vAspect > targetAspect) {
-      sw = vH * targetAspect;
-      sx = (vW - sw) / 2;
-    } else {
-      sh = vW / targetAspect;
-      sy = (vH - sh) / 2;
-    }
-
-    ctx.save();
-    if (isMirrored) {
-      ctx.translate(c.width, 0);
-      ctx.scale(-1, 1);
-    }
-    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, c.width, c.height);
-    ctx.restore();
-    const url = c.toDataURL('image/jpeg', 0.94);
-    loadImage(url).catch(() => {});
-    return url;
-  }, [cameraReady, isMirrored]);
-
-  const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-  const shootSlotWithCountdown = async (slotIdx: number) => {
-    setActiveShootingSlot(slotIdx);
-    const burstUrls: string[] = [];
-
-    for (let s = countdownSec; s >= 1; s--) {
-      setCountdownDisplay(String(s));
-      soundFX.playCountdownTick(s);
-      await sleep(500);
-      const midFrame = grabVideoFrameDataUrl();
-      if (midFrame) burstUrls.push(midFrame);
-      await sleep(500);
-    }
-
-    setCountdownDisplay(null);
-    soundFX.playShutter();
-    setShowFlash(true);
-    setTimeout(() => setShowFlash(false), 320);
-
-    const finalUrl = grabVideoFrameDataUrl();
-    if (finalUrl) {
-      burstUrls.push(finalUrl);
-      const capturedFaces = [...latestLiveFacesRef.current];
-      setPoses((prev) => {
-        const next = [...prev];
-        next[slotIdx] = { dataUrl: finalUrl, burstUrls, faceBoxes: capturedFaces };
-        return next;
-      });
-    }
-
-    await sleep(250);
+  renderStateRef.current = {
+    activeTheme,
+    layout,
+    poses,
+    activeFilter,
+    boothEffect,
+    faceEffect,
+    customHeader,
+    customCaption,
+    showDatestamp,
+    customDateText,
+    selectedSlotIndex,
+    activeShootingSlot,
+    cameraReady,
+    isMirrored,
+    countdownDisplay,
+    showFlash,
   };
 
-  const handleStartSession = async (onlySlotIndex?: number | null) => {
-    if (isCapturingSequence) return;
-    if (!cameraReady) {
-      triggerSlotUpload(typeof onlySlotIndex === 'number' ? onlySlotIndex : 0);
-      return;
-    }
-    setIsCapturingSequence(true);
+  useEffect(() => {
+    let animId = 0;
+    const renderTick = () => {
+      const s = renderStateRef.current;
+      const canvas = frameCanvasRef.current;
+      const liveVideo = s.cameraReady ? videoRef.current : null;
+      const liveFaces =
+        s.faceEffect !== 'none' && liveVideo
+          ? detectFacesInVideoFrame(liveVideo, s.isMirrored)
+          : [];
+      latestLiveFacesRef.current = liveFaces;
 
-    if (typeof onlySlotIndex === 'number') {
-      await shootSlotWithCountdown(onlySlotIndex);
-      setSelectedSlotIndex(null);
-    } else {
-      setPoses([0, 1, 2, 3].map(() => ({ dataUrl: null, burstUrls: [] })));
-      for (let i = 0; i < 4; i++) {
-        await shootSlotWithCountdown(i);
-        if (i < 3) await sleep(350);
+      if (canvas) {
+        renderLiveFrameSync({
+          canvas,
+          theme: s.activeTheme,
+          layout: s.layout,
+          poses: s.poses,
+          filter: s.activeFilter,
+          boothEffect: s.boothEffect,
+          faceEffect: s.faceEffect,
+          liveFaceBoxes: liveFaces,
+          customHeader: s.customHeader,
+          customCaption: s.customCaption,
+          showDatestamp: s.showDatestamp,
+          customDateText: s.customDateText,
+          selectedSlotIndex: s.selectedSlotIndex,
+          activeShootingSlot: s.activeShootingSlot,
+          liveVideo,
+          isMirrored: s.isMirrored,
+          countdownDisplay: s.countdownDisplay,
+          showFlash: s.showFlash,
+          renderScale: 0.5,
+        });
       }
-    }
+      animId = requestAnimationFrame(renderTick);
+    };
+    animId = requestAnimationFrame(renderTick);
+    return () => cancelAnimationFrame(animId);
+  }, [videoRef]);
 
-    setActiveShootingSlot(null);
-    setIsCapturingSequence(false);
+  const handleSelectTheme = (newId: ThemeId) => {
+    soundFX.playPop(680);
+    setThemeId(newId);
+    const nextTheme = THEMES[newId];
+    setCustomHeader(nextTheme.headerTitle);
+    setCustomCaption(nextTheme.defaultTagline);
+    setCustomDateText(nextTheme.defaultDatestamp);
   };
 
-  const handleInstantSnap = () => {
-    const firstEmpty = poses.findIndex((p) => !p.dataUrl);
-    const targetIdx =
-      selectedSlotIndex !== null
-        ? selectedSlotIndex
-        : firstEmpty !== -1
-        ? firstEmpty
-        : 0;
-
-    if (!cameraReady) {
-      triggerSlotUpload(targetIdx);
-      return;
-    }
-
-    soundFX.playShutter();
-    setShowFlash(true);
-    setTimeout(() => setShowFlash(false), 260);
-
-    const dataUrl = grabVideoFrameDataUrl();
-    if (dataUrl) {
-      const capturedFaces = [...latestLiveFacesRef.current];
-      setPoses((prev) => {
-        const next = [...prev];
-        next[targetIdx] = { dataUrl, burstUrls: [dataUrl], faceBoxes: capturedFaces };
-        return next;
-      });
-      setSelectedSlotIndex(null);
-    }
-  };
-
-  const triggerSlotUpload = (slotIdx: number) => {
-    uploadTargetSlotRef.current = slotIdx;
-    fileInputRef.current?.click();
+  const toggleSound = () => {
+    const next = !soundEnabled;
+    setSoundEnabled(next);
+    soundFX.enabled = next;
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const files = e.target.files;
     if (!files || files.length === 0) return;
-
-    Array.from(files).slice(0, 4).forEach((file, offset) => {
-      const reader = new FileReader();
-      reader.onload = async () => {
-        const result = reader.result as string;
-        const targetSlot = (uploadTargetSlotRef.current + offset) % 4;
-        setPoses((prev) => {
-          const next = [...prev];
-          next[targetSlot] = { dataUrl: result, burstUrls: [result] };
-          return next;
-        });
-        try {
-          const img = await loadImage(result);
-          const detected = await detectFacesInImage(img);
-          if (detected.length > 0) {
-            setPoses((prev) => {
-              const next = [...prev];
-              if (next[targetSlot]?.dataUrl === result) {
-                next[targetSlot] = { ...next[targetSlot], faceBoxes: detected };
-              }
-              return next;
-            });
-          }
-        } catch {
-          // Ignore detection error on uploaded image
-        }
-      };
-      reader.readAsDataURL(file);
-    });
+    handleUploadedFiles(files, uploadTargetSlotRef.current);
     e.target.value = '';
   };
 
-  // Clicking any slot on the center frame selects it to retake or live-preview
   const handleFrameClick = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = frameCanvasRef.current;
     if (!canvas) return;
@@ -486,19 +270,6 @@ export function App() {
     }
   };
 
-  // Snapshot any still-live slots if the user clicks Save PNG while posing live!
-  const getExportPoses = useCallback((): CapturedPose[] => {
-    return poses.map((p) => {
-      if (p.dataUrl) return p;
-      const snap = grabVideoFrameDataUrl();
-      return {
-        dataUrl: snap,
-        burstUrls: snap ? [snap] : [],
-        faceBoxes: [...latestLiveFacesRef.current],
-      };
-    });
-  }, [poses, grabVideoFrameDataUrl]);
-
   const handleDownloadPng = async () => {
     const exportPoses = getExportPoses();
     const offscreen = document.createElement('canvas');
@@ -508,8 +279,6 @@ export function App() {
       layout,
       poses: exportPoses,
       filter: activeFilter,
-      boothEffect,
-      faceEffect,
       customHeader,
       customCaption,
       showDatestamp,
@@ -536,8 +305,6 @@ export function App() {
         layout,
         poses: exportPoses,
         filter: activeFilter,
-        boothEffect,
-        faceEffect,
         customHeader,
         customCaption,
         showDatestamp,
@@ -560,7 +327,6 @@ export function App() {
   const handleDownloadMp4 = async () => {
     if (isExportingMp4) return;
     if (typeof VideoEncoder === 'undefined') {
-      // Fallback gracefully to GIF on mobile browsers without WebCodecs
       await handleDownloadGif();
       return;
     }
@@ -572,8 +338,6 @@ export function App() {
         layout,
         poses: exportPoses,
         filter: activeFilter,
-        boothEffect,
-        faceEffect,
         customHeader,
         customCaption,
         showDatestamp,
@@ -625,7 +389,7 @@ export function App() {
         onChange={handleFileChange}
       />
 
-      {/* LEFT DOCK (Desktop): Minimal Theme List (Bold Name Only) & Layout */}
+      {/* LEFT DOCK (Desktop): Minimal Theme List & Layout */}
       {!cleanView && (
         <aside className="side-dock desktop-only">
           <div>
@@ -697,7 +461,7 @@ export function App() {
         )}
       </main>
 
-      {/* RIGHT DOCK (Desktop): Minimal Shoot, Mac Booth FX, Filters, Footer & Save */}
+      {/* RIGHT DOCK (Desktop): Capture, Face FX, Booth FX, Filters, Text & Export */}
       {!cleanView && (
         <aside className="side-dock desktop-only">
           <div>
@@ -769,10 +533,7 @@ export function App() {
               <button
                 type="button"
                 className="btn-minimal"
-                onClick={() => {
-                  setPoses([0, 1, 2, 3].map(() => ({ dataUrl: null, burstUrls: [] })));
-                  setSelectedSlotIndex(null);
-                }}
+                onClick={resetAllPoses}
               >
                 <RotateCcw size={13} />
                 <span>Reset Live</span>
@@ -953,7 +714,7 @@ export function App() {
         </aside>
       )}
 
-      {/* Mobile Floating Top Actions (Flip Front/Back Camera + Clean View) */}
+      {/* Mobile Floating Top Actions */}
       <div className="mobile-top-actions mobile-only">
         <button
           type="button"
@@ -978,7 +739,6 @@ export function App() {
       {/* Mobile Bottom Control Sheet */}
       {!cleanView && (
         <section className="mobile-sheet mobile-only">
-          {/* Quick Capture Row */}
           <div className="mobile-quick-bar">
             <button
               type="button"
@@ -1018,10 +778,7 @@ export function App() {
             <button
               type="button"
               className="mobile-quick-btn"
-              onClick={() => {
-                setPoses([0, 1, 2, 3].map(() => ({ dataUrl: null, burstUrls: [] })));
-                setSelectedSlotIndex(null);
-              }}
+              onClick={resetAllPoses}
               title="Reset Live"
               aria-label="Reset Live"
             >
@@ -1029,7 +786,6 @@ export function App() {
             </button>
           </div>
 
-          {/* Mobile 5-Tab Bar */}
           <div className="mobile-tabs">
             {(
               [
@@ -1054,7 +810,6 @@ export function App() {
             ))}
           </div>
 
-          {/* Mobile Tab Content Tray */}
           <div className="mobile-tray">
             {mobileTab === 'frames' && (
               <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -1263,7 +1018,7 @@ export function App() {
         </section>
       )}
 
-      {/* Corner Toggle (Desktop) to Hide/Show Side Docks for IG/TikTok Aesthetic Screen Captures */}
+      {/* Corner Toggle (Desktop) */}
       <button
         type="button"
         className="clean-view-toggle"
